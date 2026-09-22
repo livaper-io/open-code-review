@@ -87,6 +87,47 @@ Go to your repository's **Settings → Secrets and variables → Actions**.
 
 > **Note:** `GITHUB_TOKEN` is automatically provided by GitHub Actions with the required `pull-requests: write` permission. By default the action sets `llm.extra_body` to `{"thinking": {"type": "disabled"}}`, disabling thinking mode for compatibility with various LLM providers; override it with the `llm_extra_body` input when your model needs different behavior, or use `llm_reasoning_effort` to steer reasoning depth on OpenAI-compatible protocols.
 
+### Use AWS Bedrock
+
+Bedrock does not take an endpoint URL and a bearer-style token the way the other providers
+do: it derives its host from the AWS region and signs requests with the AWS credential
+chain. The CLI therefore rejects `llm.url`/`llm.protocol` for it. Select it with
+`llm_provider` instead, and leave `llm_url` / `llm_auth_token` unset:
+
+```yaml
+- uses: alibaba/open-code-review@main
+  with:
+    llm_provider: bedrock
+    aws_region: eu-west-1
+    llm_model: global.anthropic.claude-opus-5
+    aws_bearer_token_bedrock: ${{ secrets.AWS_BEARER_TOKEN_BEDROCK }}
+```
+
+`llm_model` is the Bedrock model or inference-profile id (`global.*`, `us.*`, `eu.*`).
+Model access is granted per account **and per region** in the Bedrock console; an IAM policy
+alone does not enable it.
+
+To sign with SigV4 instead of a Bedrock API key, drop `aws_bearer_token_bedrock` and put
+credentials in the environment before the action — the provider picks them up from the
+ambient chain:
+
+```yaml
+- uses: aws-actions/configure-aws-credentials@v4
+  with:
+    role-to-assume: arn:aws:iam::<account>:role/<role>
+    aws-region: eu-west-1
+- uses: alibaba/open-code-review@main
+  with:
+    llm_provider: bedrock
+    aws_region: eu-west-1
+    llm_model: global.anthropic.claude-opus-5
+```
+
+`llm_reasoning_effort` is not supported on Bedrock: the `anthropic-bedrock` protocol carries
+the Anthropic request body, which rejects unknown fields. Use `llm_extra_body` instead — on
+this path it is written to `providers.bedrock.extra_body`, since `extra_body` is a
+per-provider field once a provider is active.
+
 ## Customization
 
 > These knobs are action inputs — they apply to the demo workflow and any workflow calling `alibaba/open-code-review@main`.
