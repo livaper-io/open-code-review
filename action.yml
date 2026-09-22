@@ -8,12 +8,40 @@ branding:
   color: green
 
 inputs:
+  llm_provider:
+    description: >-
+      Built-in OCR provider name written via `ocr config set provider`. Only
+      `bedrock` is special-cased today: it configures the provider from
+      aws_region and the AWS credential chain instead of llm_url/llm_auth_token,
+      which the CLI refuses to accept for the anthropic-bedrock protocol. Empty
+      (the default) keeps the llm_url/llm_protocol path unchanged.
+    required: false
+    default: ''
+  aws_region:
+    description: >-
+      AWS region written to `providers.<llm_provider>.aws_region`. Bedrock
+      derives its runtime host from this, so it is required when llm_provider is
+      `bedrock`. Ignored for every other provider.
+    required: false
+    default: ''
+  aws_bearer_token_bedrock:
+    description: >-
+      Bedrock API key, exported as AWS_BEARER_TOKEN_BEDROCK for the review. Leave
+      empty to sign requests with SigV4 from the ambient AWS credential chain
+      instead (e.g. credentials put in the environment by
+      aws-actions/configure-aws-credentials).
+    required: false
+    default: ''
   llm_url:
-    description: LLM API endpoint URL (mapped to env OCR_LLM_URL).
-    required: true
+    description: >-
+      LLM API endpoint URL (mapped to env OCR_LLM_URL). Unused when llm_provider
+      is `bedrock`.
+    required: false
   llm_auth_token:
-    description: LLM auth token (mapped to env OCR_LLM_TOKEN).
-    required: true
+    description: >-
+      LLM auth token (mapped to env OCR_LLM_TOKEN). Unused when llm_provider is
+      `bedrock`.
+    required: false
   llm_model:
     description: Model name (mapped to env OCR_LLM_MODEL).
     required: true
@@ -23,8 +51,9 @@ inputs:
       string, true, 1, or yes selects Anthropic
       case-insensitively; every other value selects the OpenAI-compatible
       protocol, preserving the CLI environment contract. Ignored when
-      llm_protocol names the protocol explicitly.
-    required: true
+      llm_protocol names the protocol explicitly. Unused when llm_provider is
+      `bedrock`.
+    required: false
   llm_protocol:
     description: >-
       Explicit LLM protocol written to `llm.protocol`: anthropic, openai or
@@ -592,6 +621,9 @@ runs:
 
     - name: Configure OCR
       env:
+        OCR_LLM_PROVIDER: ${{ inputs.llm_provider }}
+        OCR_AWS_REGION: ${{ inputs.aws_region }}
+        AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws_bearer_token_bedrock }}
         OCR_LLM_URL: ${{ inputs.llm_url }}
         OCR_LLM_MODEL: ${{ inputs.llm_model }}
         OCR_USE_ANTHROPIC: ${{ inputs.llm_use_anthropic }}
@@ -601,61 +633,89 @@ runs:
         OCR_LANGUAGE: ${{ inputs.language }}
       shell: bash
       run: |
-        # An explicit protocol wins over llm_use_anthropic: the input first,
-        # then OCR_LLM_PROTOCOL inherited from the job or step environment.
-        # Read it before the derivation below reuses that variable name.
-        EXPLICIT_PROTOCOL="$(printf '%s' "${OCR_LLM_PROTOCOL_INPUT:-${OCR_LLM_PROTOCOL:-}}" | tr '[:upper:]' '[:lower:]')"
-        NORMALIZED_USE_ANTHROPIC="$(printf '%s' "$OCR_USE_ANTHROPIC" | tr '[:upper:]' '[:lower:]')"
-        case "$NORMALIZED_USE_ANTHROPIC" in
-          ""|true|1|yes)
-            OCR_USE_ANTHROPIC="true"
-            OCR_LLM_PROTOCOL="anthropic"
-            ;;
-          *)
-            OCR_USE_ANTHROPIC="false"
-            OCR_LLM_PROTOCOL="openai"
-            ;;
-        esac
-        # use_anthropic is mirrored from the explicit protocol the same way
-        # `ocr config set llm.protocol` mirrors it, so the two never disagree.
-        case "$EXPLICIT_PROTOCOL" in
-          "")
-            ;;
-          anthropic)
-            OCR_USE_ANTHROPIC="true"
-            OCR_LLM_PROTOCOL="anthropic"
-            ;;
-          openai|openai-responses)
-            OCR_USE_ANTHROPIC="false"
-            OCR_LLM_PROTOCOL="$EXPLICIT_PROTOCOL"
-            ;;
-          *)
-            echo "::error::llm_protocol must be anthropic, openai or openai-responses (got '${EXPLICIT_PROTOCOL}')"
+        # The CLI refuses the llm.url/llm.protocol path for Bedrock:
+        # "llm.protocol cannot be anthropic-bedrock: bedrock derives its host
+        # from aws_region and signs with the AWS credential chain, so it has no
+        # use for llm.url or llm.auth_token". So a named provider gets
+        # configured as a provider, and the whole llm.* block below is skipped.
+        LLM_PROVIDER="$(printf '%s' "${OCR_LLM_PROVIDER:-}" | tr '[:upper:]' '[:lower:]')"
+        if [ "$LLM_PROVIDER" = "bedrock" ]; then
+          if [ -z "$OCR_AWS_REGION" ]; then
+            echo "::error::aws_region is required when llm_provider is bedrock; it decides which bedrock-runtime host is used"
             exit 1
-            ;;
-        esac
-        # Exported for the checkpoint fingerprint: the normalized explicit
-        # protocol, empty when neither the input nor the inherited variable
-        # was set, so checkpoints taken before the input existed stay valid.
-        echo "OCR_LLM_PROTOCOL_EXPLICIT=${EXPLICIT_PROTOCOL}" >> "$GITHUB_ENV"
-        # reasoning_effort is OpenAI-compatible vocabulary; the Anthropic API
-        # rejects unknown body fields, so fail fast instead of breaking every
-        # request. Anthropic thinking control goes through an explicit
-        # llm_extra_body key instead.
-        if [ -n "${LLM_REASONING_EFFORT:-}" ] && [ "$OCR_LLM_PROTOCOL" = "anthropic" ]; then
-          echo "::error::llm_reasoning_effort is supported only with OpenAI-compatible protocols"
-          exit 1
+          fi
+          # anthropic-bedrock carries the Anthropic request body, which rejects
+          # unknown fields exactly as the direct Anthropic API does. The guard
+          # in the else branch keys off OCR_LLM_PROTOCOL, which is never set
+          # here, so the same rule needs restating.
+          if [ -n "${LLM_REASONING_EFFORT:-}" ]; then
+            echo "::error::llm_reasoning_effort is supported only with OpenAI-compatible protocols"
+            exit 1
+          fi
+          # Empty: no llm.protocol is written on this path, and the checkpoint
+          # fingerprint reads this variable. Bedrock's own axes (llm_provider,
+          # aws_region) are fingerprinted separately by the resolve step.
+          echo "OCR_LLM_PROTOCOL_EXPLICIT=" >> "$GITHUB_ENV"
+          ocr config set provider bedrock
+          ocr config set providers.bedrock.aws_region "$OCR_AWS_REGION"
+          ocr config set model "$OCR_LLM_MODEL"
+        else
+          # An explicit protocol wins over llm_use_anthropic: the input first,
+          # then OCR_LLM_PROTOCOL inherited from the job or step environment.
+          # Read it before the derivation below reuses that variable name.
+          EXPLICIT_PROTOCOL="$(printf '%s' "${OCR_LLM_PROTOCOL_INPUT:-${OCR_LLM_PROTOCOL:-}}" | tr '[:upper:]' '[:lower:]')"
+          NORMALIZED_USE_ANTHROPIC="$(printf '%s' "$OCR_USE_ANTHROPIC" | tr '[:upper:]' '[:lower:]')"
+          case "$NORMALIZED_USE_ANTHROPIC" in
+            ""|true|1|yes)
+              OCR_USE_ANTHROPIC="true"
+              OCR_LLM_PROTOCOL="anthropic"
+              ;;
+            *)
+              OCR_USE_ANTHROPIC="false"
+              OCR_LLM_PROTOCOL="openai"
+              ;;
+          esac
+          # use_anthropic is mirrored from the explicit protocol the same way
+          # `ocr config set llm.protocol` mirrors it, so the two never disagree.
+          case "$EXPLICIT_PROTOCOL" in
+            "")
+              ;;
+            anthropic)
+              OCR_USE_ANTHROPIC="true"
+              OCR_LLM_PROTOCOL="anthropic"
+              ;;
+            openai|openai-responses)
+              OCR_USE_ANTHROPIC="false"
+              OCR_LLM_PROTOCOL="$EXPLICIT_PROTOCOL"
+              ;;
+            *)
+              echo "::error::llm_protocol must be anthropic, openai or openai-responses (got '${EXPLICIT_PROTOCOL}')"
+              exit 1
+              ;;
+          esac
+          # Exported for the checkpoint fingerprint: the normalized explicit
+          # protocol, empty when neither the input nor the inherited variable
+          # was set, so checkpoints taken before the input existed stay valid.
+          echo "OCR_LLM_PROTOCOL_EXPLICIT=${EXPLICIT_PROTOCOL}" >> "$GITHUB_ENV"
+          # reasoning_effort is OpenAI-compatible vocabulary; the Anthropic API
+          # rejects unknown body fields, so fail fast instead of breaking every
+          # request. Anthropic thinking control goes through an explicit
+          # llm_extra_body key instead.
+          if [ -n "${LLM_REASONING_EFFORT:-}" ] && [ "$OCR_LLM_PROTOCOL" = "anthropic" ]; then
+            echo "::error::llm_reasoning_effort is supported only with OpenAI-compatible protocols"
+            exit 1
+          fi
+          ocr config unset provider
+          ocr config set llm.auth_token ""
+          ocr config set llm.extra_headers ""
+          ocr config set llm.retry_codes ""
+          ocr config set llm.url "$OCR_LLM_URL"
+          ocr config set llm.model "$OCR_LLM_MODEL"
+          ocr config set llm.use_anthropic "$OCR_USE_ANTHROPIC"
+          ocr config set llm.protocol "$OCR_LLM_PROTOCOL"
+          ocr config set llm.auth_header "$OCR_LLM_AUTH_HEADER"
+          ocr config set llm.auth_token_cmd 'printf "%s" "$OCR_LLM_TOKEN"'
         fi
-        ocr config unset provider
-        ocr config set llm.auth_token ""
-        ocr config set llm.extra_headers ""
-        ocr config set llm.retry_codes ""
-        ocr config set llm.url "$OCR_LLM_URL"
-        ocr config set llm.model "$OCR_LLM_MODEL"
-        ocr config set llm.use_anthropic "$OCR_USE_ANTHROPIC"
-        ocr config set llm.protocol "$OCR_LLM_PROTOCOL"
-        ocr config set llm.auth_header "$OCR_LLM_AUTH_HEADER"
-        ocr config set llm.auth_token_cmd 'printf "%s" "$OCR_LLM_TOKEN"'
         # reasoning_effort rides the existing extra_body merge, so any
         # published CLI version supports it. An explicit reasoning_effort key
         # in llm_extra_body wins over the input — the hand-written body is the
@@ -686,7 +746,13 @@ runs:
               process.stdout.write(JSON.stringify(body));
             });')"
         fi
-        ocr config set llm.extra_body "$EFFECTIVE_EXTRA_BODY"
+        # extra_body is a per-provider field once a provider is active, so the
+        # llm.* key would be written and never read.
+        if [ "$LLM_PROVIDER" = "bedrock" ]; then
+          ocr config set providers.bedrock.extra_body "$EFFECTIVE_EXTRA_BODY"
+        else
+          ocr config set llm.extra_body "$EFFECTIVE_EXTRA_BODY"
+        fi
         ocr config set language "$OCR_LANGUAGE"
 
     - name: Resolve review range
@@ -726,6 +792,12 @@ runs:
         # alike and a checkpoint survives a change that should have killed it.
         OCR_FP_LLM_URL: ${{ inputs.llm_url }}
         OCR_FP_LLM_MODEL: ${{ inputs.llm_model }}
+        # Bedrock's equivalents of url+protocol: the provider decides how the
+        # request is built and signed, the region decides which host serves it.
+        # Both change what a review would say, so both must invalidate a
+        # checkpoint taken under the other.
+        OCR_FP_LLM_PROVIDER: ${{ inputs.llm_provider }}
+        OCR_FP_AWS_REGION: ${{ inputs.aws_region }}
         OCR_FP_LLM_USE_ANTHROPIC: ${{ inputs.llm_use_anthropic }}
         OCR_FP_LLM_PROTOCOL: ${{ env.OCR_LLM_PROTOCOL_EXPLICIT }}
         OCR_FP_LANGUAGE: ${{ inputs.language }}
@@ -870,6 +942,8 @@ runs:
                 process.env.OCR_FP_LLM_URL,
                 process.env.OCR_FP_LLM_MODEL,
                 process.env.OCR_FP_LLM_USE_ANTHROPIC,
+                process.env.OCR_FP_LLM_PROVIDER,
+                process.env.OCR_FP_AWS_REGION,
                 // The explicit protocol as Configure OCR resolved it — the input
                 // first, then OCR_LLM_PROTOCOL inherited from the job — so a
                 // protocol switched through the environment alone still fails
@@ -948,6 +1022,10 @@ runs:
 
     - name: Run OpenCodeReview
       env:
+        # Read by the CLI's bedrock provider. Empty means "sign with SigV4 from
+        # the ambient AWS credential chain instead", which is what a caller
+        # using aws-actions/configure-aws-credentials wants.
+        AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws_bearer_token_bedrock }}
         OCR_LLM_URL: ${{ inputs.llm_url }}
         OCR_LLM_TOKEN: ${{ inputs.llm_auth_token }}
         OCR_LLM_MODEL: ${{ inputs.llm_model }}
