@@ -568,6 +568,14 @@ runs:
       shell: bash
       env:
         OCR_VERSION: ${{ inputs.ocr_version }}
+        # The CLI spawns a DETACHED background `npm i -g <pkg>@latest` on its
+        # first invocation (bin/ocr.js: no cooldown file exists on a fresh
+        # runner, so the check always fires). That relinks the `ocr` bin while
+        # later steps are starting — an intermittent "ocr: command not found" —
+        # and silently replaces the very version ocr_version pinned, after
+        # OCR_VERSION_ACTUAL has already been read into the checkpoint
+        # fingerprint. Opt out for every step that invokes the CLI.
+        OCR_NO_UPDATE: '1'
       run: |
         npm install -g "@alibaba-group/open-code-review@${OCR_VERSION}"
         echo "OpenCodeReview installed:"
@@ -621,6 +629,7 @@ runs:
 
     - name: Configure OCR
       env:
+        OCR_NO_UPDATE: '1'
         OCR_LLM_PROVIDER: ${{ inputs.llm_provider }}
         OCR_AWS_REGION: ${{ inputs.aws_region }}
         AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws_bearer_token_bedrock }}
@@ -1025,6 +1034,7 @@ runs:
         # Read by the CLI's bedrock provider. Empty means "sign with SigV4 from
         # the ambient AWS credential chain instead", which is what a caller
         # using aws-actions/configure-aws-credentials wants.
+        OCR_NO_UPDATE: '1'
         AWS_BEARER_TOKEN_BEDROCK: ${{ inputs.aws_bearer_token_bedrock }}
         OCR_LLM_URL: ${{ inputs.llm_url }}
         OCR_LLM_TOKEN: ${{ inputs.llm_auth_token }}
